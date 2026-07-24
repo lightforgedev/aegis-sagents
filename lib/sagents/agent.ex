@@ -99,6 +99,7 @@ defmodule Sagents.Agent do
           | {:ok, State.t(), ToolResult.t()}
           | {:interrupt, State.t(), any()}
           | {:pause, State.t()}
+          | {:error, State.t(), any()}
           | {:error, any()}
 
   @create_fields [
@@ -523,6 +524,12 @@ defmodule Sagents.Agent do
     from the `execute/3` return value; it is not persisted across a state
     serialize/reload.
 
+  - `:return_error_state` - Internal integration option. When true, errors
+    returned by `LLMChain.run/2` include the state extracted from the failed
+    chain as `{:error, state, reason}`. This lets a durable executor persist
+    the completed turns before reporting the error. The default remains
+    `{:error, reason}` for compatibility.
+
   ## Returns
 
   - `{:ok, state}` - Normal completion
@@ -530,6 +537,8 @@ defmodule Sagents.Agent do
     the third element is the matching `%LangChain.Message.ToolResult{}` (see those
     options and `Sagents.AgentResult`)
   - `{:interrupt, state, interrupt_data}` - Execution paused for human approval
+  - `{:error, state, reason}` - Execution failed after a chain advanced; returned
+    only with `return_error_state: true`
   - `{:error, reason}` - Execution failed
 
   ## Examples
@@ -601,6 +610,9 @@ defmodule Sagents.Agent do
         {:pause, paused_state} ->
           # Infrastructure pause - return immediately without after_model hooks
           {:pause, paused_state}
+
+        {:error, error_state, reason} ->
+          {:error, error_state, reason}
 
         {:error, reason} ->
           {:error, reason}
@@ -749,11 +761,11 @@ defmodule Sagents.Agent do
          {:ok, chain} <- build_chain_impl(agent, langchain_messages, state, callbacks) do
       chain
       |> execute_chain(agent.middleware, agent, opts)
-      |> handle_chain_result(state)
+      |> handle_chain_result(state, opts)
     end
   end
 
-  defp handle_chain_result({:ok, executed_chain}, state) do
+  defp handle_chain_result({:ok, executed_chain}, state, _opts) do
     with {:ok, final_state} <- extract_state_from_chain(executed_chain, state) do
       # Check if the last message was cancelled due to a streaming error
       # (e.g. content filtering). The error is stored in message metadata
@@ -765,13 +777,13 @@ defmodule Sagents.Agent do
     end
   end
 
-  defp handle_chain_result({:ok, executed_chain, extra}, state) do
+  defp handle_chain_result({:ok, executed_chain, extra}, state, _opts) do
     with {:ok, final_state} <- extract_state_from_chain(executed_chain, state) do
       {:ok, final_state, extra}
     end
   end
 
-  defp handle_chain_result({:interrupt, interrupted_chain, interrupt_data}, state) do
+  defp handle_chain_result({:interrupt, interrupted_chain, interrupt_data}, state, _opts) do
     # Tool calls need human approval - return interrupt with current state
     with {:ok, interrupted_state} <- extract_state_from_chain(interrupted_chain, state) do
       # Add interrupt_data to state so it's available during resume
@@ -780,14 +792,22 @@ defmodule Sagents.Agent do
     end
   end
 
-  defp handle_chain_result({:pause, paused_chain}, state) do
+  defp handle_chain_result({:pause, paused_chain}, state, _opts) do
     # Infrastructure pause (e.g., node draining). Extract state and propagate.
     with {:ok, paused_state} <- extract_state_from_chain(paused_chain, state) do
       {:pause, paused_state}
     end
   end
 
-  defp handle_chain_result({:error, reason}, _state), do: {:error, reason}
+  defp handle_chain_result({:error, failed_chain, reason}, state, opts) do
+    with {:ok, error_state} <- extract_state_from_chain(failed_chain, state) do
+      if Keyword.get(opts, :return_error_state, false) do
+        {:error, error_state, reason}
+      else
+        {:error, reason}
+      end
+    end
+  end
 
   defp check_for_streaming_error(%State{messages: messages}) do
     case List.last(messages) do
@@ -986,20 +1006,20 @@ defmodule Sagents.Agent do
       {:pause, chain} ->
         {:pause, chain}
 
-      {:error, _chain, %LangChainError{type: "exceeded_max_runs"} = reason} ->
+      {:error, chain, %LangChainError{type: "exceeded_max_runs"} = reason} ->
         Logger.warning(
           "Agent #{agent.agent_id} exceeded max_runs limit (#{reason.message}). " <>
             "Set :max_runs on the Agent struct or pass max_runs: N to Agent.execute/3 opts."
         )
 
-        {:error,
+        {:error, chain,
          %LangChainError{
            reason
            | message: "Max number of automated turns reached. You may continue if desired."
          }}
 
-      {:error, _chain, %LangChainError{} = reason} ->
-        {:error, reason}
+      {:error, chain, %LangChainError{} = reason} ->
+        {:error, chain, reason}
     end
   end
 

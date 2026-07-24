@@ -2364,7 +2364,10 @@ defmodule Sagents.AgentServer do
     callbacks = [pubsub_callbacks]
 
     # Execute agent with callbacks
-    case Agent.execute(server_state.agent, server_state.state, callbacks: callbacks) do
+    case Agent.execute(server_state.agent, server_state.state,
+           callbacks: callbacks,
+           return_error_state: true
+         ) do
       {:ok, new_state} ->
         # Broadcast state changes
         broadcast_state_changes(server_state, new_state)
@@ -2384,6 +2387,9 @@ defmodule Sagents.AgentServer do
         # Infrastructure pause (e.g., node draining) - broadcast state and propagate
         broadcast_state_changes(server_state, paused_state)
         {:pause, paused_state}
+
+      {:error, %State{} = error_state, reason} ->
+        {:error, error_state, reason}
 
       {:error, reason} ->
         {:error, reason}
@@ -2517,6 +2523,28 @@ defmodule Sagents.AgentServer do
 
     # Broadcast debug event for state update
     broadcast_debug_event(updated_state, {:agent_state_update, paused_state})
+
+    {:noreply, Map.delete(updated_state, :task)}
+  end
+
+  defp handle_execution_result({:error, %State{} = error_state, reason}, server_state) do
+    updated_state = %{
+      server_state
+      | status: :error,
+        state: error_state,
+        error: reason
+    }
+
+    updated_state = maybe_persist_state(updated_state, :on_error)
+
+    persist_error_as_display_message(updated_state, reason)
+
+    broadcast_event(updated_state, {:status_changed, :error, reason})
+    update_presence_status(updated_state, :error)
+
+    updated_state = reset_inactivity_timer(updated_state)
+
+    broadcast_debug_event(updated_state, {:agent_state_update, error_state})
 
     {:noreply, Map.delete(updated_state, :task)}
   end

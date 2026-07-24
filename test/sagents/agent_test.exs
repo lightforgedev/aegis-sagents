@@ -514,6 +514,44 @@ defmodule Sagents.AgentTest do
                Agent.execute(agent, initial_state)
     end
 
+    test "returns chain-derived state on max_runs when requested" do
+      tool =
+        LangChain.Function.new!(%{
+          name: "test_tool",
+          description: "A test tool",
+          function: fn _args, _context -> {:ok, "done"} end
+        })
+
+      stub(ChatAnthropic, :call, fn _model, _messages, _tools ->
+        {:ok,
+         [
+           Message.new_assistant!(%{
+             tool_calls: [
+               ToolCall.new!(%{
+                 call_id: "call_#{:erlang.unique_integer([:positive])}",
+                 name: "test_tool",
+                 arguments: %{}
+               })
+             ]
+           })
+         ]}
+      end)
+
+      {:ok, agent} =
+        Agent.new(
+          %{model: mock_model(), tools: [tool], max_runs: 1},
+          replace_default_middleware: true
+        )
+
+      initial_state = State.new!(%{messages: [Message.new_user!("Hello")]})
+
+      assert {:error, %State{} = error_state, %LangChainError{type: "exceeded_max_runs"}} =
+               Agent.execute(agent, initial_state, return_error_state: true)
+
+      assert length(error_state.messages) > length(initial_state.messages)
+      assert List.first(error_state.messages).role == :user
+    end
+
     test "max_runs in execute opts overrides agent struct" do
       # Agent struct has max_runs: 100 but execute opts set max_runs: 1
       tool =
