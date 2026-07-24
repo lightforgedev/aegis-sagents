@@ -2340,12 +2340,9 @@ defmodule Sagents.AgentServer do
         broadcast_debug_event(server_state, {:llm_error, error})
       end,
 
-      # :on_error fires ONCE when the chain encounters a terminal error and is
-      # returning it to the caller. This fires after all recovery options
-      # (retries, fallbacks) are exhausted.
-      on_error: fn _chain, error ->
-        broadcast_event(server_state, {:chain_error, error})
-      end,
+      # Terminal errors are published by handle_execution_result/2 only after
+      # the state returned by Agent.execute/3 has crossed the durability boundary.
+      on_error: fn _chain, _error -> :ok end,
 
       # Sub-agent HITL resolution callback
       # Fired from Agent.resume_subagent_hitl after the sub-agent completes/fails,
@@ -2535,18 +2532,13 @@ defmodule Sagents.AgentServer do
         error: reason
     }
 
-    updated_state = maybe_persist_state(updated_state, :on_error)
+    case persist_error_state(updated_state) do
+      {:ok, persisted_state} ->
+        publish_persisted_error(persisted_state, reason, error_state)
 
-    persist_error_as_display_message(updated_state, reason)
-
-    broadcast_event(updated_state, {:status_changed, :error, reason})
-    update_presence_status(updated_state, :error)
-
-    updated_state = reset_inactivity_timer(updated_state)
-
-    broadcast_debug_event(updated_state, {:agent_state_update, error_state})
-
-    {:noreply, Map.delete(updated_state, :task)}
+      {:error, persistence_reason} ->
+        publish_error_state_persistence_failure(updated_state, persistence_reason)
+    end
   end
 
   defp handle_execution_result({:error, reason}, server_state) do
@@ -2556,19 +2548,13 @@ defmodule Sagents.AgentServer do
         error: reason
     }
 
-    # Persist agent state on error
-    updated_state = maybe_persist_state(updated_state, :on_error)
+    case persist_error_state(updated_state) do
+      {:ok, persisted_state} ->
+        publish_persisted_error(persisted_state, reason, persisted_state.state)
 
-    # Persist an assistant message describing the error so it survives page reloads
-    persist_error_as_display_message(updated_state, reason)
-
-    broadcast_event(updated_state, {:status_changed, :error, reason})
-    update_presence_status(updated_state, :error)
-
-    # Reset activity timer after error
-    updated_state = reset_inactivity_timer(updated_state)
-
-    {:noreply, Map.delete(updated_state, :task)}
+      {:error, persistence_reason} ->
+        publish_error_state_persistence_failure(updated_state, persistence_reason)
+    end
   end
 
   # Broadcast state changes - broadcasts todos and debug state update
@@ -2809,6 +2795,64 @@ defmodule Sagents.AgentServer do
 
         maybe_update_interrupt_flag(server_state, module, lifecycle)
     end
+  end
+
+  # An execution error is a resume boundary. Do not report the original error
+  # as resumable until the state associated with it is durable.
+  defp persist_error_state(%ServerState{} = server_state) do
+    case server_state.agent_persistence do
+      nil ->
+        {:ok, server_state}
+
+      module ->
+        state_data =
+          StateSerializer.serialize_server_state(
+            server_state.agent,
+            server_state.state
+          )
+
+        scope = current_scope(server_state)
+        context = Map.put(callback_context(server_state), :lifecycle, :on_error)
+
+        case module.persist_state(scope, state_data, context) do
+          :ok ->
+            {:ok, maybe_update_interrupt_flag(server_state, module, :on_error)}
+
+          {:error, reason} ->
+            Logger.error(
+              "Agent error-state persistence failed for #{server_state.agent.agent_id}: #{inspect(reason)}"
+            )
+
+            {:error, reason}
+        end
+    end
+  end
+
+  defp publish_persisted_error(%ServerState{} = server_state, reason, error_state) do
+    # The display message and notifications are emitted only after persistence.
+    persist_error_as_display_message(server_state, reason)
+    broadcast_event(server_state, {:chain_error, reason})
+    broadcast_event(server_state, {:status_changed, :error, reason})
+    update_presence_status(server_state, :error)
+
+    updated_state = reset_inactivity_timer(server_state)
+    broadcast_debug_event(updated_state, {:agent_state_update, error_state})
+
+    {:noreply, Map.delete(updated_state, :task)}
+  end
+
+  defp publish_error_state_persistence_failure(%ServerState{} = server_state, persistence_reason) do
+    durability_error = {:error_state_persistence_failed, persistence_reason}
+    failed_state = %{server_state | error: durability_error}
+
+    # A restart cannot safely resume this state; do not publish the original
+    # model error or a durable display message that would imply otherwise.
+    broadcast_debug_event(failed_state, {:agent_state_persistence_failed, persistence_reason})
+    broadcast_event(failed_state, {:status_changed, :error, durability_error})
+    update_presence_status(failed_state, :error)
+
+    failed_state = reset_inactivity_timer(failed_state)
+    {:noreply, Map.delete(failed_state, :task)}
   end
 
   # Fire set_interrupted/3 only on actual transitions of the durable flag.
