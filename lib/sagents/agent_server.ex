@@ -240,6 +240,9 @@ defmodule Sagents.AgentServer do
       # Phoenix.PubSub server name (atom) used only for presence wiring (subscribing
       # to presence_diff broadcasts). Per-agent events go directly to subscribers.
       :pubsub_name,
+      # Opt-in compatibility bridge for hosts that still consume per-agent
+      # events through Phoenix.PubSub topics.
+      :legacy_pubsub,
       :interrupt_data,
       :error,
       :inactivity_timeout,
@@ -279,6 +282,7 @@ defmodule Sagents.AgentServer do
             status: :idle | :running | :interrupted | :cancelled | :error,
             publisher: Sagents.Publisher.State.t(),
             pubsub_name: atom() | nil,
+            legacy_pubsub: boolean(),
             interrupt_data: map() | nil,
             error: term() | nil,
             inactivity_timeout: pos_integer() | nil | :infinity,
@@ -324,6 +328,8 @@ defmodule Sagents.AgentServer do
     Used **only** for presence wiring (subscribing to `Phoenix.Presence`
     diff broadcasts). Per-agent events are delivered directly to
     subscribers via `Sagents.Publisher`, no PubSub required.
+  - `:legacy_pubsub` - When `true`, also broadcasts main-channel events to
+    `"agent_server:<agent_id>"` on `:pubsub`. Default: `false`.
   - `:name` - Server name registration (optional, defaults to `get_name(agent.agent_id)`)
   - `:inactivity_timeout` - Timeout in milliseconds for automatic shutdown due to inactivity (default: 300_000 - 5 minutes)
     Set to `nil` or `:infinity` to disable automatic shutdown
@@ -1290,7 +1296,7 @@ defmodule Sagents.AgentServer do
     # that read it.
     {boot_status, boot_interrupt_data, state} = derive_boot_status(state)
 
-    # The :pubsub option is only used for presence wiring (subscribing
+    # The :pubsub option is used for presence wiring (subscribing
     # to presence_diff broadcasts from Phoenix.Presence). Per-agent events are
     # delivered directly to subscriber pids via Sagents.Publisher.
     # Accepted shapes: nil | {module(), atom()} (the module is unused).
@@ -1299,6 +1305,8 @@ defmodule Sagents.AgentServer do
         {_module, name} when is_atom(name) -> name
         nil -> nil
       end
+
+    legacy_pubsub = Keyword.get(opts, :legacy_pubsub, false)
 
     # allow a nil value to disable the timeout
     inactivity_timeout = Keyword.get(opts, :inactivity_timeout, 300_000)
@@ -1358,6 +1366,7 @@ defmodule Sagents.AgentServer do
       status: boot_status,
       publisher: publisher_state,
       pubsub_name: pubsub_name,
+      legacy_pubsub: legacy_pubsub,
       interrupt_data: boot_interrupt_data,
       error: nil,
       inactivity_timeout: inactivity_timeout,
@@ -3290,8 +3299,19 @@ defmodule Sagents.AgentServer do
   # `{:agent, event}` so consumers can pattern-match on origin.
   defp broadcast_event(%ServerState{} = server_state, event) do
     Publisher.broadcast(server_state.publisher, :main, main_envelope(event))
+    maybe_broadcast_legacy_pubsub(server_state, event)
     :ok
   end
+
+  defp maybe_broadcast_legacy_pubsub(
+         %ServerState{legacy_pubsub: true, pubsub_name: pubsub_name, agent: agent},
+         event
+       )
+       when is_atom(pubsub_name) do
+    Phoenix.PubSub.broadcast(pubsub_name, "agent_server:#{agent.agent_id}", main_envelope(event))
+  end
+
+  defp maybe_broadcast_legacy_pubsub(_server_state, _event), do: :ok
 
   # Direct send/2 fan-out to debug-channel subscribers. The outer `:agent` tag
   # identifies the producer; the inner `:debug` tag distinguishes the channel.

@@ -809,6 +809,7 @@ defmodule Sagents.AgentServerTest do
           initial_state: initial_state,
           name: AgentServer.get_name(agent_id),
           pubsub: {Phoenix.PubSub, pubsub_name},
+          legacy_pubsub: true,
           id: "test_agent_#{:erlang.unique_integer([:positive])}"
         )
 
@@ -830,6 +831,25 @@ defmodule Sagents.AgentServerTest do
       assert_receive {:agent, {:status_changed, :running, nil}}, 100
 
       # Should receive idle status (wrapped in {:agent, event} tuple)
+      assert_receive {:agent, {:status_changed, :idle, nil}}, 100
+    end
+
+    test "optionally mirrors main events to the legacy Phoenix topic", %{
+      agent: agent,
+      agent_id: agent_id,
+      pubsub_name: pubsub_name
+    } do
+      :ok = AgentServer.unsubscribe(agent_id)
+      Phoenix.PubSub.subscribe(pubsub_name, "agent_server:#{agent_id}")
+
+      Agent
+      |> expect(:execute, fn ^agent, state, _opts ->
+        {:ok, state}
+      end)
+
+      :ok = AgentServer.execute(agent_id)
+
+      assert_receive {:agent, {:status_changed, :running, nil}}, 100
       assert_receive {:agent, {:status_changed, :idle, nil}}, 100
     end
 
