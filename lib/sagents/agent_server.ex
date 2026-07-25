@@ -240,6 +240,9 @@ defmodule Sagents.AgentServer do
       # Phoenix.PubSub server name (atom) used only for presence wiring (subscribing
       # to presence_diff broadcasts). Per-agent events go directly to subscribers.
       :pubsub_name,
+      # Opt-in compatibility bridge for hosts that still consume per-agent
+      # events through Phoenix.PubSub topics.
+      :legacy_pubsub,
       :interrupt_data,
       :error,
       :inactivity_timeout,
@@ -279,6 +282,7 @@ defmodule Sagents.AgentServer do
             status: :idle | :running | :interrupted | :cancelled | :error,
             publisher: Sagents.Publisher.State.t(),
             pubsub_name: atom() | nil,
+            legacy_pubsub: boolean(),
             interrupt_data: map() | nil,
             error: term() | nil,
             inactivity_timeout: pos_integer() | nil | :infinity,
@@ -324,6 +328,8 @@ defmodule Sagents.AgentServer do
     Used **only** for presence wiring (subscribing to `Phoenix.Presence`
     diff broadcasts). Per-agent events are delivered directly to
     subscribers via `Sagents.Publisher`, no PubSub required.
+  - `:legacy_pubsub` - When `true`, also broadcasts main-channel events to
+    `"agent_server:<agent_id>"` on `:pubsub`. Default: `false`.
   - `:name` - Server name registration (optional, defaults to `get_name(agent.agent_id)`)
   - `:inactivity_timeout` - Timeout in milliseconds for automatic shutdown due to inactivity (default: 300_000 - 5 minutes)
     Set to `nil` or `:infinity` to disable automatic shutdown
@@ -1290,7 +1296,7 @@ defmodule Sagents.AgentServer do
     # that read it.
     {boot_status, boot_interrupt_data, state} = derive_boot_status(state)
 
-    # The :pubsub option is only used for presence wiring (subscribing
+    # The :pubsub option is used for presence wiring (subscribing
     # to presence_diff broadcasts from Phoenix.Presence). Per-agent events are
     # delivered directly to subscriber pids via Sagents.Publisher.
     # Accepted shapes: nil | {module(), atom()} (the module is unused).
@@ -1299,6 +1305,8 @@ defmodule Sagents.AgentServer do
         {_module, name} when is_atom(name) -> name
         nil -> nil
       end
+
+    legacy_pubsub = Keyword.get(opts, :legacy_pubsub, false)
 
     # allow a nil value to disable the timeout
     inactivity_timeout = Keyword.get(opts, :inactivity_timeout, 300_000)
@@ -1358,6 +1366,7 @@ defmodule Sagents.AgentServer do
       status: boot_status,
       publisher: publisher_state,
       pubsub_name: pubsub_name,
+      legacy_pubsub: legacy_pubsub,
       interrupt_data: boot_interrupt_data,
       error: nil,
       inactivity_timeout: inactivity_timeout,
@@ -2340,12 +2349,9 @@ defmodule Sagents.AgentServer do
         broadcast_debug_event(server_state, {:llm_error, error})
       end,
 
-      # :on_error fires ONCE when the chain encounters a terminal error and is
-      # returning it to the caller. This fires after all recovery options
-      # (retries, fallbacks) are exhausted.
-      on_error: fn _chain, error ->
-        broadcast_event(server_state, {:chain_error, error})
-      end,
+      # Terminal errors are published by handle_execution_result/2 only after
+      # the state returned by Agent.execute/3 has crossed the durability boundary.
+      on_error: fn _chain, _error -> :ok end,
 
       # Sub-agent HITL resolution callback
       # Fired from Agent.resume_subagent_hitl after the sub-agent completes/fails,
@@ -2364,7 +2370,10 @@ defmodule Sagents.AgentServer do
     callbacks = [pubsub_callbacks]
 
     # Execute agent with callbacks
-    case Agent.execute(server_state.agent, server_state.state, callbacks: callbacks) do
+    case Agent.execute(server_state.agent, server_state.state,
+           callbacks: callbacks,
+           return_error_state: true
+         ) do
       {:ok, new_state} ->
         # Broadcast state changes
         broadcast_state_changes(server_state, new_state)
@@ -2384,6 +2393,9 @@ defmodule Sagents.AgentServer do
         # Infrastructure pause (e.g., node draining) - broadcast state and propagate
         broadcast_state_changes(server_state, paused_state)
         {:pause, paused_state}
+
+      {:error, %State{} = error_state, reason} ->
+        {:error, error_state, reason}
 
       {:error, reason} ->
         {:error, reason}
@@ -2521,6 +2533,23 @@ defmodule Sagents.AgentServer do
     {:noreply, Map.delete(updated_state, :task)}
   end
 
+  defp handle_execution_result({:error, %State{} = error_state, reason}, server_state) do
+    updated_state = %{
+      server_state
+      | status: :error,
+        state: error_state,
+        error: reason
+    }
+
+    case persist_error_state(updated_state) do
+      {:ok, persisted_state} ->
+        publish_persisted_error(persisted_state, reason, error_state)
+
+      {:error, persistence_reason} ->
+        publish_error_state_persistence_failure(updated_state, persistence_reason)
+    end
+  end
+
   defp handle_execution_result({:error, reason}, server_state) do
     updated_state = %{
       server_state
@@ -2528,19 +2557,13 @@ defmodule Sagents.AgentServer do
         error: reason
     }
 
-    # Persist agent state on error
-    updated_state = maybe_persist_state(updated_state, :on_error)
+    case persist_error_state(updated_state) do
+      {:ok, persisted_state} ->
+        publish_persisted_error(persisted_state, reason, persisted_state.state)
 
-    # Persist an assistant message describing the error so it survives page reloads
-    persist_error_as_display_message(updated_state, reason)
-
-    broadcast_event(updated_state, {:status_changed, :error, reason})
-    update_presence_status(updated_state, :error)
-
-    # Reset activity timer after error
-    updated_state = reset_inactivity_timer(updated_state)
-
-    {:noreply, Map.delete(updated_state, :task)}
+      {:error, persistence_reason} ->
+        publish_error_state_persistence_failure(updated_state, persistence_reason)
+    end
   end
 
   # Broadcast state changes - broadcasts todos and debug state update
@@ -2781,6 +2804,64 @@ defmodule Sagents.AgentServer do
 
         maybe_update_interrupt_flag(server_state, module, lifecycle)
     end
+  end
+
+  # An execution error is a resume boundary. Do not report the original error
+  # as resumable until the state associated with it is durable.
+  defp persist_error_state(%ServerState{} = server_state) do
+    case server_state.agent_persistence do
+      nil ->
+        {:ok, server_state}
+
+      module ->
+        state_data =
+          StateSerializer.serialize_server_state(
+            server_state.agent,
+            server_state.state
+          )
+
+        scope = current_scope(server_state)
+        context = Map.put(callback_context(server_state), :lifecycle, :on_error)
+
+        case module.persist_state(scope, state_data, context) do
+          :ok ->
+            {:ok, maybe_update_interrupt_flag(server_state, module, :on_error)}
+
+          {:error, reason} ->
+            Logger.error(
+              "Agent error-state persistence failed for #{server_state.agent.agent_id}: #{inspect(reason)}"
+            )
+
+            {:error, reason}
+        end
+    end
+  end
+
+  defp publish_persisted_error(%ServerState{} = server_state, reason, error_state) do
+    # The display message and notifications are emitted only after persistence.
+    persist_error_as_display_message(server_state, reason)
+    broadcast_event(server_state, {:chain_error, reason})
+    broadcast_event(server_state, {:status_changed, :error, reason})
+    update_presence_status(server_state, :error)
+
+    updated_state = reset_inactivity_timer(server_state)
+    broadcast_debug_event(updated_state, {:agent_state_update, error_state})
+
+    {:noreply, Map.delete(updated_state, :task)}
+  end
+
+  defp publish_error_state_persistence_failure(%ServerState{} = server_state, persistence_reason) do
+    durability_error = {:error_state_persistence_failed, persistence_reason}
+    failed_state = %{server_state | error: durability_error}
+
+    # A restart cannot safely resume this state; do not publish the original
+    # model error or a durable display message that would imply otherwise.
+    broadcast_debug_event(failed_state, {:agent_state_persistence_failed, persistence_reason})
+    broadcast_event(failed_state, {:status_changed, :error, durability_error})
+    update_presence_status(failed_state, :error)
+
+    failed_state = reset_inactivity_timer(failed_state)
+    {:noreply, Map.delete(failed_state, :task)}
   end
 
   # Fire set_interrupted/3 only on actual transitions of the durable flag.
@@ -3218,8 +3299,19 @@ defmodule Sagents.AgentServer do
   # `{:agent, event}` so consumers can pattern-match on origin.
   defp broadcast_event(%ServerState{} = server_state, event) do
     Publisher.broadcast(server_state.publisher, :main, main_envelope(event))
+    maybe_broadcast_legacy_pubsub(server_state, event)
     :ok
   end
+
+  defp maybe_broadcast_legacy_pubsub(
+         %ServerState{legacy_pubsub: true, pubsub_name: pubsub_name, agent: agent},
+         event
+       )
+       when is_atom(pubsub_name) do
+    Phoenix.PubSub.broadcast(pubsub_name, "agent_server:#{agent.agent_id}", main_envelope(event))
+  end
+
+  defp maybe_broadcast_legacy_pubsub(_server_state, _event), do: :ok
 
   # Direct send/2 fan-out to debug-channel subscribers. The outer `:agent` tag
   # identifies the producer; the inner `:debug` tag distinguishes the channel.

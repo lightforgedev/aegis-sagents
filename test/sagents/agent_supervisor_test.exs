@@ -86,6 +86,27 @@ defmodule Sagents.AgentSupervisorTest do
       Supervisor.stop(sup_pid)
     end
 
+    test "forwards legacy_pubsub to AgentServer" do
+      pubsub_name = :"test_pubsub_#{System.unique_integer([:positive])}"
+      start_supervised!({Phoenix.PubSub, name: pubsub_name})
+
+      agent = create_test_agent()
+      Phoenix.PubSub.subscribe(pubsub_name, "agent_server:#{agent.agent_id}")
+
+      assert {:ok, sup_pid} =
+               AgentSupervisor.start_link(
+                 agent: agent,
+                 pubsub: {Phoenix.PubSub, pubsub_name},
+                 legacy_pubsub: true
+               )
+
+      assert :ok = AgentServer.execute(agent.agent_id)
+      assert_receive {:agent, {:status_changed, :running, nil}}, 1_000
+      assert_receive {:agent, {:status_changed, :idle, nil}}, 1_000
+
+      Supervisor.stop(sup_pid)
+    end
+
     test "raises error if agent is not provided" do
       # The supervisor will exit when start_link fails
       Process.flag(:trap_exit, true)

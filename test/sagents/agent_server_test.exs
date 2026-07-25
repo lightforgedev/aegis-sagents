@@ -809,6 +809,7 @@ defmodule Sagents.AgentServerTest do
           initial_state: initial_state,
           name: AgentServer.get_name(agent_id),
           pubsub: {Phoenix.PubSub, pubsub_name},
+          legacy_pubsub: true,
           id: "test_agent_#{:erlang.unique_integer([:positive])}"
         )
 
@@ -830,6 +831,25 @@ defmodule Sagents.AgentServerTest do
       assert_receive {:agent, {:status_changed, :running, nil}}, 100
 
       # Should receive idle status (wrapped in {:agent, event} tuple)
+      assert_receive {:agent, {:status_changed, :idle, nil}}, 100
+    end
+
+    test "optionally mirrors main events to the legacy Phoenix topic", %{
+      agent: agent,
+      agent_id: agent_id,
+      pubsub_name: pubsub_name
+    } do
+      :ok = AgentServer.unsubscribe(agent_id)
+      Phoenix.PubSub.subscribe(pubsub_name, "agent_server:#{agent_id}")
+
+      Agent
+      |> expect(:execute, fn ^agent, state, _opts ->
+        {:ok, state}
+      end)
+
+      :ok = AgentServer.execute(agent_id)
+
+      assert_receive {:agent, {:status_changed, :running, nil}}, 100
       assert_receive {:agent, {:status_changed, :idle, nil}}, 100
     end
 
@@ -920,15 +940,34 @@ defmodule Sagents.AgentServerTest do
       assert_receive {:agent, {:status_changed, :error, "Test error"}}, 200
     end
 
-    test "broadcasts chain_error via on_error callback", %{agent: agent, agent_id: agent_id} do
+    test "persists chain-derived error state", %{agent: agent, agent_id: agent_id} do
+      advanced_state =
+        State.new!(%{
+          messages: [Message.new_user!("original task"), Message.new_assistant!("progress")]
+        })
+
+      Agent
+      |> expect(:execute, fn ^agent, _state, opts ->
+        assert Keyword.get(opts, :return_error_state) == true
+        {:error, advanced_state, "Test error"}
+      end)
+
+      :ok = AgentServer.execute(agent_id)
+
+      assert_receive {:agent, {:status_changed, :running, nil}}, 100
+      assert_receive {:agent, {:status_changed, :error, "Test error"}}, 200
+      assert AgentServer.get_state(agent_id) == advanced_state
+    end
+
+    test "broadcasts chain_error after terminal state is handled", %{
+      agent: agent,
+      agent_id: agent_id
+    } do
       error = LangChain.LangChainError.exception(message: "All retries exhausted")
 
       Agent
-      |> expect(:execute, fn ^agent, state, opts ->
-        # Extract the PubSub callbacks and fire on_error like LLMChain would
-        [pubsub_callbacks | _rest] = Keyword.fetch!(opts, :callbacks)
-        pubsub_callbacks.on_error.(nil, error)
-        {:ok, state}
+      |> expect(:execute, fn ^agent, _state, _opts ->
+        {:error, error}
       end)
 
       :ok = AgentServer.execute(agent_id)
@@ -1003,8 +1042,8 @@ defmodule Sagents.AgentServerTest do
     end
   end
 
-  describe "state persistence on 3-tuple completion" do
-    alias Sagents.TestAgentPersistence
+  describe "state persistence" do
+    alias Sagents.{TestAgentPersistence, TestFailingAgentPersistence}
 
     setup do
       # Start a test PubSub
@@ -1064,6 +1103,90 @@ defmodule Sagents.AgentServerTest do
       assert ctx.lifecycle == :on_completion
       assert persisted_state_data["version"] == 2
       assert persisted_state_data["state"] != nil
+    end
+
+    test "persists chain-derived state on error", %{
+      agent: agent,
+      agent_id: agent_id,
+      pubsub_name: pubsub_name
+    } do
+      initial_state = State.new!(%{messages: [Message.new_user!("original task")]})
+
+      error_state =
+        State.new!(%{
+          messages: [Message.new_user!("original task"), Message.new_assistant!("progress")]
+        })
+
+      Agent
+      |> expect(:execute, fn ^agent, _state, opts ->
+        assert Keyword.get(opts, :return_error_state) == true
+        {:error, error_state, "max runs"}
+      end)
+
+      {:ok, _pid} =
+        AgentServer.start_link(
+          agent: agent,
+          initial_state: initial_state,
+          name: AgentServer.get_name(agent_id),
+          pubsub: {Phoenix.PubSub, pubsub_name},
+          id: "test_persist_error_#{:erlang.unique_integer([:positive])}",
+          agent_persistence: TestAgentPersistence
+        )
+
+      :ok = AgentServer.execute(agent_id)
+      Process.sleep(100)
+
+      assert AgentServer.get_status(agent_id) == :error
+
+      error_call =
+        TestAgentPersistence.get_calls_for(agent_id)
+        |> Enum.find(fn {_id, _scope, _data, ctx} -> ctx.lifecycle == :on_error end)
+
+      assert {^agent_id, _scope, persisted_state_data, %{lifecycle: :on_error}} = error_call
+
+      assert Enum.map(persisted_state_data["state"]["messages"], & &1["role"]) == [
+               "user",
+               "assistant"
+             ]
+    end
+
+    test "fails closed when error state persistence fails", %{
+      agent: agent,
+      agent_id: agent_id,
+      pubsub_name: pubsub_name
+    } do
+      initial_state = State.new!(%{messages: [Message.new_user!("original task")]})
+
+      error_state =
+        State.new!(%{
+          messages: [Message.new_user!("original task"), Message.new_assistant!("progress")]
+        })
+
+      Agent
+      |> expect(:execute, fn ^agent, _state, _opts ->
+        {:error, error_state, "max runs"}
+      end)
+
+      {:ok, _pid} =
+        AgentServer.start_link(
+          agent: agent,
+          initial_state: initial_state,
+          name: AgentServer.get_name(agent_id),
+          pubsub: {Phoenix.PubSub, pubsub_name},
+          id: "test_persist_error_failure_#{:erlang.unique_integer([:positive])}",
+          agent_persistence: TestFailingAgentPersistence
+        )
+
+      {:ok, _pid, _ref} = AgentServer.subscribe(agent_id)
+      :ok = AgentServer.execute(agent_id)
+
+      durability_error = {:error_state_persistence_failed, :storage_unavailable}
+
+      assert_receive {:agent, {:status_changed, :running, nil}}, 100
+      assert_receive {:agent, {:status_changed, :error, ^durability_error}}, 200
+      refute_receive {:agent, {:status_changed, :error, "max runs"}}, 50
+      refute_receive {:agent, {:chain_error, "max runs"}}, 50
+      assert AgentServer.get_state(agent_id) == error_state
     end
 
     test "calls agent_persistence on resume 3-tuple completion", %{

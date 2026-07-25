@@ -101,3 +101,18 @@ defmodule Sagents.TestAgentPersistence do
     :ok
   end
 end
+
+defmodule Sagents.TestFailingAgentPersistence do
+  @moduledoc false
+
+  @behaviour Sagents.AgentPersistence
+
+  @impl true
+  def persist_state(_scope, _state_data, _context), do: {:error, :storage_unavailable}
+
+  @impl true
+  def load_state(_scope, _context), do: {:error, :not_found}
+
+  @impl true
+  def set_interrupted(_scope, _context, _interrupted?), do: :ok
+end
