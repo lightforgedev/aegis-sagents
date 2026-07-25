@@ -24,6 +24,7 @@ defmodule Sagents.AgentSupervisor do
   - `:agent` - The Agent struct (required)
   - `:initial_state` - Initial State for AgentServer (optional)
   - `:pubsub` - PubSub configuration as `{module(), atom()}` tuple or `nil` (optional, default: nil)
+  - `:legacy_pubsub` - Mirror main-channel events to the legacy Phoenix topic (optional, default: `false`)
   - `:shutdown_delay` - Delay in milliseconds to allow the supervisor to gracefully stop all children (optional, default: 5000)
   - `:conversation_id` - Optional conversation identifier for message persistence (optional, default: nil)
   - `:agent_persistence` - Module implementing `Sagents.AgentPersistence` (optional, default: nil)
@@ -140,6 +141,8 @@ defmodule Sagents.AgentSupervisor do
   - `:pubsub` - PubSub configuration as `{module(), atom()}` tuple or `nil` (optional, default: nil).
     Used only for `Phoenix.Presence` `presence_diff` wiring; per-agent events are
     delivered directly to subscriber pids via `Sagents.Publisher`.
+  - `:legacy_pubsub` - When `true`, mirror main-channel events to
+    `"agent_server:<agent_id>"` on the configured Phoenix PubSub (optional, default: `false`)
   - `:inactivity_timeout` - Timeout in milliseconds for automatic shutdown (optional, default: 300_000 - 5 minutes)
     Set to `nil` or `:infinity` to disable automatic shutdown
   - `:name` - Supervisor name registration (optional)
@@ -297,6 +300,7 @@ defmodule Sagents.AgentSupervisor do
     # This is critical for Horde redistribution where the child spec's initial_state is stale
     {initial_state, restored} = resolve_initial_state(config, agent)
     pubsub = Keyword.get(config, :pubsub)
+    legacy_pubsub = Keyword.get(config, :legacy_pubsub, false)
     inactivity_timeout = Keyword.get(config, :inactivity_timeout, 300_000)
     shutdown_delay = Keyword.get(config, :shutdown_delay, 5000)
     presence_tracking = Keyword.get(config, :presence_tracking)
@@ -322,6 +326,11 @@ defmodule Sagents.AgentSupervisor do
     # Add pubsub if provided
     agent_server_opts =
       if pubsub, do: Keyword.put(agent_server_opts, :pubsub, pubsub), else: agent_server_opts
+
+    agent_server_opts =
+      if legacy_pubsub,
+        do: Keyword.put(agent_server_opts, :legacy_pubsub, true),
+        else: agent_server_opts
 
     # Add presence_tracking if provided
     agent_server_opts =
