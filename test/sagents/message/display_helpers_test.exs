@@ -147,6 +147,29 @@ defmodule Sagents.Message.DisplayHelpersTest do
       assert [] = items
     end
 
+    test "filters whitespace-only string content" do
+      message = Message.new_assistant!("\n\t ")
+
+      assert [] = DisplayHelpers.extract_display_items(message)
+    end
+
+    test "filters whitespace-only text and thinking parts while preserving tool calls" do
+      tool_call = ToolCall.new!(%{call_id: "1", name: "shell", arguments: %{}})
+
+      message =
+        Message.new_assistant!(%{
+          content: [ContentPart.thinking!("\n\n"), ContentPart.text!(" \t ")],
+          tool_calls: [tool_call]
+        })
+
+      assert [
+               %{
+                 type: :tool_call,
+                 content: %{"call_id" => "1", "name" => "shell"}
+               }
+             ] = DisplayHelpers.extract_display_items(message)
+    end
+
     test "preserves display_text from ToolCall field when present" do
       # ToolCall has a direct display_text field (like ToolResult)
       tool_call =
