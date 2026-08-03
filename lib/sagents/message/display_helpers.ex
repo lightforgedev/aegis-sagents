@@ -101,20 +101,24 @@ defmodule Sagents.Message.DisplayHelpers do
 
     case content do
       # String content (simple text)
-      text when is_binary(text) and text != "" ->
-        [
-          %{
-            type: :text,
-            message_type: message_type,
-            content: %{"text" => text}
-          }
-        ]
+      text when is_binary(text) ->
+        if blank_display_text?(text) do
+          []
+        else
+          [
+            %{
+              type: :text,
+              message_type: message_type,
+              content: %{"text" => text}
+            }
+          ]
+        end
 
       # List of ContentParts (text, thinking, etc.)
       parts when is_list(parts) ->
         parts
         |> Enum.filter(fn part -> part.type in [:text, :thinking] end)
-        |> Enum.reject(fn part -> is_nil(part.content) or part.content == "" end)
+        |> Enum.reject(fn part -> not displayable_text?(part.content) end)
         |> Enum.map(fn part ->
           %{
             type: part.type,
@@ -184,6 +188,14 @@ defmodule Sagents.Message.DisplayHelpers do
   end
 
   defp extract_tool_result_content(_other), do: ""
+
+  # Providers may emit whitespace-only text alongside a tool call or reasoning
+  # part. It is protocol-valid but has no display value, so do not persist it
+  # as a transcript item.
+  defp displayable_text?(text) when is_binary(text), do: not blank_display_text?(text)
+  defp displayable_text?(_text), do: false
+
+  defp blank_display_text?(text), do: String.trim(text) == ""
 
   # Convert Message role to display message_type atom
   defp role_to_message_type(:system), do: :system
